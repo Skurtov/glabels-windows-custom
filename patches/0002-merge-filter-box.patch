@@ -1,0 +1,489 @@
+Add a filter box to the Merge record list.
+
+With a long merge file it is hard to find the record(s) to print: the Merge
+tab only offers a scrolling list of checkboxes plus Select all / Unselect all.
+
+This adds, above the records table:
+
+  * a "Filter records..." box.  Every whitespace-separated word must appear
+    (case-insensitively, as plain text) in at least one column of a record
+    for it to be shown, so "smith paris" narrows to Smiths in Paris.
+  * a counter: "N of M selected", or "N of M shown, K selected" while a
+    filter is active.  All records start out selected and hidden records stay
+    selected, so without it a user could filter to one record, print, and get
+    every record.
+  * "Select shown" / "Unselect shown" buttons that change only the records
+    currently visible.  The existing Select all / Unselect all still act on
+    every record.
+
+Records hidden by the filter keep their checked state and are still printed
+if they are checked.  Rows keep their original record numbers, ticking a box
+in a filtered list selects the right underlying record, and the filter text
+survives Reload and a change of merge source.
+
+Implementation notes:
+  * MergeView puts a QSortFilterProxyModel subclass between MergeTableModel
+    and the QTableView.  This also stops leaking a MergeTableModel on every
+    reload (they previously had no parent and were never deleted).
+  * merge::Merge gains setSelectedRecords(rows, state), which emits
+    selectionChanged() once.  Looping over setSelected() would refresh the
+    whole table once per row.  Covered by a new case in TestMerge.
+  * No change to the file format, to printing, or to any other dialog.
+
+glabels_C.ts is deliberately not touched; new strings show untranslated
+(English) until the maintainer next runs lupdate.
+
+Removable if upstream adds an equivalent filter to the Merge tab.
+
+diff --git a/backends/merge/Merge.cpp b/backends/merge/Merge.cpp
+index 2b89d4d..dbb1a77 100644
+--- a/backends/merge/Merge.cpp
++++ b/backends/merge/Merge.cpp
+@@ -132,6 +132,22 @@ namespace glabels::merge
+         }
+ 
+ 
++        ///
++        /// Set selection state of several records at once (emits selectionChanged() only once)
++        ///
++        void Merge::setSelectedRecords( const QList<int>& rows, bool state )
++        {
++                for ( int i : rows )
++                {
++                        if ( (i >= 0) && (i < mRecordList.size()) )
++                        {
++                                mRecordList[i].setSelected( state );
++                        }
++                }
++                emit selectionChanged();
++        }
++
++
+         ///
+         /// Select all records
+         ///
+diff --git a/backends/merge/Merge.hpp b/backends/merge/Merge.hpp
+index c26bb4d..64f3ee2 100644
+--- a/backends/merge/Merge.hpp
++++ b/backends/merge/Merge.hpp
+@@ -78,6 +78,7 @@ namespace glabels::merge
+                 /////////////////////////////////
+         public:
+                 void setSelected( int i, bool state = true );
++                void setSelectedRecords( const QList<int>& rows, bool state = true );
+                 void selectAll();
+                 void unselectAll();
+ 
+diff --git a/glabels/MergeView.cpp b/glabels/MergeView.cpp
+index 6f67076..fc6c821 100644
+--- a/glabels/MergeView.cpp
++++ b/glabels/MergeView.cpp
+@@ -30,17 +30,73 @@
+ #include <QDebug>
+ #include <QFileDialog>
+ #include <QFileInfo>
++#include <QRegularExpression>
++#include <QSortFilterProxyModel>
+ 
+ 
+ namespace glabels
+ {
+         const QChar NEWLINE_CHAR = QChar(0x23CE);
+ 
++
++        ///
++        /// Record filter: a row is shown when every whitespace-separated term of the
++        /// filter text is found (case-insensitively) in at least one of its columns.
++        ///
++        class MergeFilterProxyModel : public QSortFilterProxyModel
++        {
++        public:
++                MergeFilterProxyModel( QObject* parent = nullptr )
++                        : QSortFilterProxyModel( parent )
++                {
++                }
++
++                void setFilterText( const QString& text )
++                {
++                        static const QRegularExpression whitespace( "\\s+" );
++                mTerms = text.split( whitespace, Qt::SkipEmptyParts );
++                        invalidateFilter();
++                }
++
++                bool isActive() const
++                {
++                        return !mTerms.isEmpty();
++                }
++
++        protected:
++                bool filterAcceptsRow( int sourceRow, const QModelIndex& sourceParent ) const override
++                {
++                        for ( const auto& term : mTerms )
++                        {
++                                bool found = false;
++                                for ( int col = 0; col < sourceModel()->columnCount( sourceParent ); col++ )
++                                {
++                                        auto index = sourceModel()->index( sourceRow, col, sourceParent );
++                                        if ( sourceModel()->data( index, Qt::DisplayRole ).toString().contains( term, Qt::CaseInsensitive ) )
++                                        {
++                                                found = true;
++                                                break;
++                                        }
++                                }
++                                if ( !found )
++                                {
++                                        return false;
++                                }
++                        }
++                        return true;
++                }
++
++        private:
++                QStringList mTerms;
++        };
++
++
+         ///
+         /// Constructor
+         ///
+         MergeView::MergeView( QWidget *parent )
+-                : QWidget(parent), mModel(nullptr), mUndoRedoModel(nullptr), mOldFormatComboIndex(0)
++                : QWidget(parent), mModel(nullptr), mUndoRedoModel(nullptr), mOldFormatComboIndex(0),
++                  mTableModel(nullptr), mFilterModel(nullptr)
+         {
+                 setupUi( this );
+ 
+@@ -64,6 +120,7 @@ namespace glabels
+ 
+                 onMergeChanged();
+                 connect( mModel, SIGNAL(mergeChanged()), this, SLOT(onMergeChanged()) );
++                connect( mModel, &model::Model::mergeSelectionChanged, this, &MergeView::updateFilterCount );
+         }
+ 
+ 
+@@ -100,8 +157,7 @@ namespace glabels
+                         break;
+                 }
+ 
+-                recordsTableView->setModel( new MergeTableModel( mModel->merge() ) );
+-                recordsTableView->resizeColumnsToContents();
++                resetRecordsTable();
+ 
+                 connect( mModel->merge(), SIGNAL(sourceChanged()),
+                          this, SLOT(onMergeSourceChanged()) );
+@@ -116,8 +172,104 @@ namespace glabels
+                 QString fn = model::FileUtil::makeRelativeIfInDir( mModel->dir(), mModel->merge()->source() );
+                 locationLineEdit->setText( fn );
+ 
+-                recordsTableView->setModel( new MergeTableModel( mModel->merge() ) );
++                resetRecordsTable();
++        }
++
++
++        ///
++        /// (Re)build the records table: merge records -> filter -> view
++        ///
++        void MergeView::resetRecordsTable()
++        {
++                auto* oldFilterModel = mFilterModel;
++                auto* oldTableModel  = mTableModel;
++
++                mTableModel  = new MergeTableModel( mModel->merge(), this );
++                mFilterModel = new MergeFilterProxyModel( this );
++                mFilterModel->setSourceModel( mTableModel );
++                mFilterModel->setFilterText( filterLineEdit->text() );
++
++                recordsTableView->setModel( mFilterModel );
+                 recordsTableView->resizeColumnsToContents();
++
++                // Only release the previous models once the view no longer uses them
++                delete oldFilterModel;
++                delete oldTableModel;
++
++                updateFilterCount();
++        }
++
++
++        ///
++        /// Update the record counter next to the filter box.
++        ///
++        /// The selected count is always shown: records hidden by the filter stay
++        /// selected (and are printed), and all records start out selected.
++        ///
++        void MergeView::updateFilterCount()
++        {
++                if ( !mModel || !mFilterModel )
++                {
++                        filterCountLabel->setText( "" );
++                        return;
++                }
++
++                int nRecords  = mFilterModel->sourceModel()->rowCount();
++                int nSelected = mModel->merge()->nSelectedRecords();
++
++                if ( nRecords == 0 )
++                {
++                        filterCountLabel->setText( "" );
++                }
++                else if ( mFilterModel->isActive() )
++                {
++                        filterCountLabel->setText( tr("%1 of %2 shown, %3 selected")
++                                                   .arg( mFilterModel->rowCount() )
++                                                   .arg( nRecords )
++                                                   .arg( nSelected ) );
++                }
++                else
++                {
++                        filterCountLabel->setText( tr("%1 of %2 selected")
++                                                   .arg( nSelected )
++                                                   .arg( nRecords ) );
++                }
++        }
++
++
++        ///
++        /// Source row numbers of the records that pass the current filter
++        ///
++        QList<int> MergeView::shownSourceRows() const
++        {
++                QList<int> rows;
++
++                if ( !mFilterModel )
++                {
++                        return rows;
++                }
++
++                for ( int i = 0; i < mFilterModel->rowCount(); i++ )
++                {
++                        rows.push_back( mFilterModel->mapToSource( mFilterModel->index( i, 0 ) ).row() );
++                }
++
++                return rows;
++        }
++
++
++        ///
++        /// Filter text changed handler
++        ///
++        void MergeView::onFilterTextChanged()
++        {
++                if ( !mFilterModel )
++                {
++                        return;
++                }
++
++                mFilterModel->setFilterText( filterLineEdit->text() );
++                updateFilterCount();
+         }
+ 
+ 
+@@ -173,6 +325,24 @@ namespace glabels
+         }
+ 
+ 
++        ///
++        /// Select shown button clicked handler (only records passing the filter)
++        ///
++        void MergeView::onSelectShownButtonClicked()
++        {
++                mModel->merge()->setSelectedRecords( shownSourceRows(), true );
++        }
++
++
++        ///
++        /// Unselect shown button clicked handler (only records passing the filter)
++        ///
++        void MergeView::onUnselectShownButtonClicked()
++        {
++                mModel->merge()->setSelectedRecords( shownSourceRows(), false );
++        }
++
++
+         ///
+         /// Reload button clicked handler
+         ///
+diff --git a/glabels/MergeView.hpp b/glabels/MergeView.hpp
+index 4b79653..2051238 100644
+--- a/glabels/MergeView.hpp
++++ b/glabels/MergeView.hpp
+@@ -34,6 +34,8 @@ namespace glabels
+ 
+         // Forward references
+         class UndoRedoModel;
++        class MergeTableModel;
++        class MergeFilterProxyModel;
+ 
+ 
+         ///
+@@ -69,6 +71,9 @@ namespace glabels
+                 void onLocationBrowseButtonClicked();
+                 void onSelectAllButtonClicked();
+                 void onUnselectAllButtonClicked();
++                void onSelectShownButtonClicked();
++                void onUnselectShownButtonClicked();
++                void onFilterTextChanged();
+                 void onReloadButtonClicked();
+ 
+ 
+@@ -78,6 +83,10 @@ namespace glabels
+         private:
+                 static QString printableTextForView( QString text );
+ 
++                void resetRecordsTable();
++                void updateFilterCount();
++                QList<int> shownSourceRows() const;
++
+ 
+                 /////////////////////////////////
+                 // Private Data
+@@ -95,6 +104,9 @@ namespace glabels
+ 
+                 int  mOldFormatComboIndex;
+ 
++                MergeTableModel*       mTableModel;
++                MergeFilterProxyModel* mFilterModel;
++
+         };
+ 
+ }
+diff --git a/glabels/ui/MergeView.ui b/glabels/ui/MergeView.ui
+index ba0eea3..594b123 100644
+--- a/glabels/ui/MergeView.ui
++++ b/glabels/ui/MergeView.ui
+@@ -95,7 +95,28 @@
+         <string>Records</string>
+        </property>
+        <layout class="QGridLayout" name="gridLayout_4">
+-        <item row="1" column="0">
++        <item row="0" column="0">
++         <layout class="QHBoxLayout" name="filterLayout">
++          <item>
++           <widget class="QLineEdit" name="filterLineEdit">
++            <property name="placeholderText">
++             <string>Filter records...</string>
++            </property>
++            <property name="clearButtonEnabled">
++             <bool>true</bool>
++            </property>
++           </widget>
++          </item>
++          <item>
++           <widget class="QLabel" name="filterCountLabel">
++            <property name="text">
++             <string notr="true"/>
++            </property>
++           </widget>
++          </item>
++         </layout>
++        </item>
++        <item row="2" column="0">
+          <layout class="QHBoxLayout" name="horizontalLayout">
+           <item>
+            <widget class="QPushButton" name="selectAllButton">
+@@ -111,6 +132,26 @@
+             </property>
+            </widget>
+           </item>
++          <item>
++           <widget class="QPushButton" name="selectShownButton">
++            <property name="toolTip">
++             <string>Select only the records currently shown by the filter</string>
++            </property>
++            <property name="text">
++             <string>Select shown</string>
++            </property>
++           </widget>
++          </item>
++          <item>
++           <widget class="QPushButton" name="unselectShownButton">
++            <property name="toolTip">
++             <string>Unselect only the records currently shown by the filter</string>
++            </property>
++            <property name="text">
++             <string>Unselect shown</string>
++            </property>
++           </widget>
++          </item>
+           <item>
+            <spacer name="horizontalSpacer_2">
+             <property name="orientation">
+@@ -133,7 +174,7 @@
+           </item>
+          </layout>
+         </item>
+-        <item row="0" column="0">
++        <item row="1" column="0">
+          <widget class="QTableView" name="recordsTableView">
+           <property name="focusPolicy">
+            <enum>Qt::NoFocus</enum>
+@@ -196,6 +237,24 @@
+     </hint>
+    </hints>
+   </connection>
++  <connection>
++   <sender>selectShownButton</sender>
++   <signal>clicked()</signal>
++   <receiver>MergeView</receiver>
++   <slot>onSelectShownButtonClicked()</slot>
++  </connection>
++  <connection>
++   <sender>unselectShownButton</sender>
++   <signal>clicked()</signal>
++   <receiver>MergeView</receiver>
++   <slot>onUnselectShownButtonClicked()</slot>
++  </connection>
++  <connection>
++   <sender>filterLineEdit</sender>
++   <signal>textChanged(QString)</signal>
++   <receiver>MergeView</receiver>
++   <slot>onFilterTextChanged()</slot>
++  </connection>
+   <connection>
+    <sender>formatCombo</sender>
+    <signal>activated(int)</signal>
+@@ -251,5 +310,8 @@
+   <slot>onFormatComboActivated()</slot>
+   <slot>onLocationBrowseButtonClicked()</slot>
+   <slot>onReloadButtonClicked()</slot>
++  <slot>onSelectShownButtonClicked()</slot>
++  <slot>onUnselectShownButtonClicked()</slot>
++  <slot>onFilterTextChanged()</slot>
+  </slots>
+ </ui>
+diff --git a/model/unit_tests/TestMerge.cpp b/model/unit_tests/TestMerge.cpp
+index b1f91eb..b91355c 100644
+--- a/model/unit_tests/TestMerge.cpp
++++ b/model/unit_tests/TestMerge.cpp
+@@ -35,6 +35,7 @@
+ #include "merge/Record.hpp"
+ 
+ #include <QDebug>
++#include <QSignalSpy>
+ 
+ 
+ QTEST_MAIN(TestMerge)
+@@ -269,6 +270,24 @@ void TestMerge::text()
+         QCOMPARE( merge->nSelectedRecords(), 1 );
+         QCOMPARE( merge->selectedRecords().size(), 1 );
+ 
++        // Bulk selection: one signal, out-of-range rows ignored
++        QSignalSpy selectionSpy( merge, &Merge::selectionChanged );
++        merge->unselectAll();
++        selectionSpy.clear();
++        merge->setSelectedRecords( QList<int>{ 1, 4, 5, -1, 99 } );
++        QCOMPARE( selectionSpy.count(), 1 );
++        QCOMPARE( merge->nSelectedRecords(), 3 );
++        QCOMPARE( merge->selectedRecords().first(), recordList[1] );
++        QCOMPARE( merge->selectedRecords().last(), recordList[5] );
++        merge->setSelectedRecords( QList<int>{ 4 }, false );
++        QCOMPARE( merge->nSelectedRecords(), 2 );
++        merge->setSelectedRecords( QList<int>{} );
++        QCOMPARE( merge->nSelectedRecords(), 2 );
++
++        // Restore state expected below
++        merge->unselectAll();
++        merge->setSelected( 3 );
++
+         //
+         // Keys
+         //
