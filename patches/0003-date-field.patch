@@ -12,9 +12,24 @@ glabels-batch-qt -- so it always shows the current date at print time.
   ${DATE:+2w} ${DATE:+6m} ${DATE:+1y}   ...or weeks, months, years
   ${DATE:+30:@yyyy-MM-dd}      modifiers combine; also with :n and :%...
 
+The field inserts only the date -- no other text.
+
 The "Insert substitution field" button for text and barcodes gains a
-"Date when printed" section with ready-made formats, each showing what it
-gives today.  The image and colour field buttons are unchanged.
+"Date when printed" section offering the date formats in common use,
+each shown with what it gives today:
+
+  ${DATE}                 system short date format (follows Windows settings)
+  ${DATE:@yyyy-MM-dd}     2026-11-17   ISO 8601
+  ${DATE:@dd/MM/yyyy}     17/11/2026   UK, much of Europe, Latin America, Australia
+  ${DATE:@MM/dd/yyyy}     11/17/2026   United States
+  ${DATE:@dd.MM.yyyy}     17.11.2026   Germany, Russia, central/eastern Europe
+  ${DATE:@dd-MM-yyyy}     17-11-2026   Netherlands, India
+  ${DATE:@yyyy/MM/dd}     2026/11/17   Japan, China, Korea
+  ${DATE:@d MMM yyyy}     17 Nov 2026  (month name in the system language)
+  ${DATE:@MMM d, yyyy}    Nov 17, 2026
+  ${DATE:@yyyyMMdd}       20261117     compact, for lot codes / barcodes
+
+The image and colour field buttons are unchanged.
 
 A merge field or user variable named DATE (non-empty) still takes precedence,
 so existing labels that use such a field are unaffected.  Field names are
@@ -33,7 +48,7 @@ the maintainer next runs lupdate.
 Removable if upstream adds an equivalent date field.
 
 diff --git a/glabels/FieldButton.cpp b/glabels/FieldButton.cpp
-index c3b5576..4cc8c82 100644
+index c3b5576..e32b958 100644
 --- a/glabels/FieldButton.cpp
 +++ b/glabels/FieldButton.cpp
 @@ -21,6 +21,8 @@
@@ -63,7 +78,7 @@ index c3b5576..4cc8c82 100644
  
                  // Add merge keys, if any
                  mMenu.addSection( tr("Merge fields") );
-@@ -76,7 +82,54 @@ namespace glabels
+@@ -76,7 +82,58 @@ namespace glabels
                          action->setEnabled( false );
                  }
  
@@ -73,12 +88,16 @@ index c3b5576..4cc8c82 100644
 +                {
 +                        const QString date = model::SubstitutionField::dateFieldName();
 +                        const QStringList keys = {
-+                                date,
-+                                date + ":@yyyy-MM-dd",
-+                                date + ":@MM/dd/yyyy",
-+                                date + ":@dd/MM/yyyy",
-+                                date + ":@d MMM yyyy",
-+                                date + ":+30:@yyyy-MM-dd",
++                                date,                       // system short date format
++                                date + ":@yyyy-MM-dd",      // ISO 8601
++                                date + ":@dd/MM/yyyy",      // UK, much of Europe, Latin America, Australia
++                                date + ":@MM/dd/yyyy",      // United States
++                                date + ":@dd.MM.yyyy",      // Germany, Russia, central/eastern Europe
++                                date + ":@dd-MM-yyyy",      // Netherlands, India
++                                date + ":@yyyy/MM/dd",      // Japan, China, Korea
++                                date + ":@d MMM yyyy",      // 17 Nov 2026
++                                date + ":@MMM d, yyyy",     // Nov 17, 2026
++                                date + ":@yyyyMMdd",        // compact, for lot codes / barcodes
 +                        };
 +
 +                        mMenu.addSection( tr("Date when printed") );
